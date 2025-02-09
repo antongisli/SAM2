@@ -1,0 +1,17 @@
+torch>=2.3.0
+torchvision>=0.18.0
+opencv-python
+numpy
+scipy
+segment-anything-py
+matplotlib
+pillow
+shapely
+yt-dlp
+open_clip_torch
+supervision
+moviepy
+ultralytics
+tqdm
+python-dotenv==1.0.0
+clip @ git+https://github.com/openai/CLIP.git
