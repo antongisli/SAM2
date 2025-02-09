@@ -95,8 +95,8 @@ class VideoAnalysisPipeline:
         self.frame_count = 0
         self.interaction_log = []
         
-        # Define text prompts for CLIP
-        self.text_inputs = [
+        # Define text prompts for CLIP - fuel trucks
+        self.fuel_truck_prompts = [
             "an airport fuel truck refueling an aircraft",
             "a fuel tanker truck at an airport",
             "an aviation fuel truck",
@@ -107,13 +107,29 @@ class VideoAnalysisPipeline:
             "a catering truck"
         ]
         
+        # Define text prompts for CLIP - planes
+        self.plane_prompts = [
+            "a commercial aircraft on the ground",
+            "an airplane at the airport gate",
+            "a passenger jet on the tarmac",
+            "an airport vehicle or truck",
+            "airport ground equipment",
+            "an airport baggage cart"
+        ]
+        
         # Get text features for fuel truck classification
-        text_tokens = clip.tokenize(self.text_inputs).to(self.device)
+        text_tokens = clip.tokenize(self.fuel_truck_prompts).to(self.device)
         with torch.no_grad():
-            self.text_features = self.clip_model.encode_text(text_tokens)
-            self.text_features /= self.text_features.norm(dim=-1, keepdim=True)
+            self.fuel_truck_features = self.clip_model.encode_text(text_tokens)
+            self.fuel_truck_features /= self.fuel_truck_features.norm(dim=-1, keepdim=True)
             
-        # First 3 prompts are positive (fuel trucks), rest are negative
+        # Get text features for plane classification
+        text_tokens = clip.tokenize(self.plane_prompts).to(self.device)
+        with torch.no_grad():
+            self.plane_features = self.clip_model.encode_text(text_tokens)
+            self.plane_features /= self.plane_features.norm(dim=-1, keepdim=True)
+            
+        # First 3 prompts are positive for each category
         self.num_positive_prompts = 3
 
     def download_sam_model(self) -> str:
@@ -246,24 +262,23 @@ class VideoAnalysisPipeline:
         results = self.detector(rgb_frame)
         timing['yolo'] = time.time() - t0
         
-        # Extract vehicles and planes
-        vehicles = [
-            {
-                'box': box.xyxy[0].cpu().numpy(),
-                'score': box.conf[0].cpu().numpy(),
-                'class': box.cls[0].cpu().numpy()
-            }
-            for box in results[0].boxes
-            if box.cls[0].cpu().numpy() in [2, 7]  # cars/trucks
-        ]
-        planes = [
-            {
-                'box': box.xyxy[0].cpu().numpy(),
-                'score': box.conf[0].cpu().numpy()
-            }
-            for box in results[0].boxes
-            if box.cls[0].cpu().numpy() == 5  # planes
-        ]
+        # Extract potential vehicles and planes from YOLO
+        vehicles = []
+        potential_planes = []
+        
+        for box in results[0].boxes:
+            cls = box.cls[0].cpu().numpy()
+            if cls in [2, 7]:  # cars/trucks
+                vehicles.append({
+                    'box': box.xyxy[0].cpu().numpy(),
+                    'score': box.conf[0].cpu().numpy(),
+                    'class': cls
+                })
+            elif cls == 5:  # planes
+                potential_planes.append({
+                    'box': box.xyxy[0].cpu().numpy(),
+                    'score': box.conf[0].cpu().numpy()
+                })
         
         # Step 2: CLIP Verification for vehicles (batch processing)
         t0 = time.time()
@@ -271,6 +286,7 @@ class VideoAnalysisPipeline:
         if vehicles:
             # Prepare batch of vehicle crops
             vehicle_crops = []
+            valid_vehicles = []
             for vehicle in vehicles:
                 x1, y1, x2, y2 = map(int, vehicle['box'])
                 if x1 >= x2 or y1 >= y2:
@@ -280,6 +296,7 @@ class VideoAnalysisPipeline:
                     continue
                 crop_pil = Image.fromarray(crop)
                 vehicle_crops.append(self.clip_preprocess(crop_pil))
+                valid_vehicles.append(vehicle)
             
             if vehicle_crops:
                 # Batch process all vehicles
@@ -287,16 +304,16 @@ class VideoAnalysisPipeline:
                 with torch.no_grad():
                     image_features = self.clip_model.encode_image(vehicle_batch)
                     image_features /= image_features.norm(dim=-1, keepdim=True)
-                    similarity = (100.0 * image_features @ self.text_features.T).softmax(dim=-1)
+                    similarity = (100.0 * image_features @ self.fuel_truck_features.T).softmax(dim=-1)
                 
                 # Process results
-                for i, (vehicle, scores) in enumerate(zip(vehicles, similarity)):
+                for i, (vehicle, scores) in enumerate(zip(valid_vehicles, similarity)):
                     positive_score = scores[:self.num_positive_prompts].mean().item()
                     negative_score = scores[self.num_positive_prompts:].mean().item()
                     score_diff = positive_score - negative_score
                     
                     logger.info(f"\nCLIP Scores for vehicle {i+1}:")
-                    for prompt, score in zip(self.text_inputs, scores):
+                    for prompt, score in zip(self.fuel_truck_prompts, scores):
                         logger.info(f"- {prompt}: {score.item():.3f}")
                     logger.info(f"Positive avg: {positive_score:.3f}, Negative avg: {negative_score:.3f}")
                     
@@ -304,46 +321,80 @@ class VideoAnalysisPipeline:
                         vehicle['clip_score'] = score_diff
                         fuel_trucks.append(vehicle)
         
-        timing['clip'] = time.time() - t0
+        timing['clip_trucks'] = time.time() - t0
         
-        # Step 3: SAM-based proximity analysis (batch processing)
-        t0 = time.time()
+        # Only proceed with plane detection if we found fuel trucks
+        verified_planes = []
+        if fuel_trucks and potential_planes:
+            # Step 3: CLIP Verification for planes
+            t0 = time.time()
+            plane_crops = []
+            valid_planes = []
+            
+            for plane in potential_planes:
+                x1, y1, x2, y2 = map(int, plane['box'])
+                if x1 >= x2 or y1 >= y2:
+                    continue
+                crop = frame[y1:y2, x1:x2]
+                if crop.size == 0:
+                    continue
+                crop_pil = Image.fromarray(crop)
+                plane_crops.append(self.clip_preprocess(crop_pil))
+                valid_planes.append(plane)
+            
+            if plane_crops:
+                # Batch process all planes
+                plane_batch = torch.stack(plane_crops).to(self.device)
+                with torch.no_grad():
+                    image_features = self.clip_model.encode_image(plane_batch)
+                    image_features /= image_features.norm(dim=-1, keepdim=True)
+                    similarity = (100.0 * image_features @ self.plane_features.T).softmax(dim=-1)
+                
+                # Process results
+                for i, (plane, scores) in enumerate(zip(valid_planes, similarity)):
+                    positive_score = scores[:self.num_positive_prompts].mean().item()
+                    negative_score = scores[self.num_positive_prompts:].mean().item()
+                    score_diff = positive_score - negative_score
+                    
+                    logger.info(f"\nCLIP Scores for plane {i+1}:")
+                    for prompt, score in zip(self.plane_prompts, scores):
+                        logger.info(f"- {prompt}: {score.item():.3f}")
+                    logger.info(f"Positive avg: {positive_score:.3f}, Negative avg: {negative_score:.3f}")
+                    
+                    if score_diff > 0.3:
+                        plane['clip_score'] = score_diff
+                        verified_planes.append(plane)
+            
+            timing['clip_planes'] = time.time() - t0
+        
+        # Step 4: SAM-based proximity analysis (only if we have both fuel trucks and verified planes)
         interactions = []
-        
-        # Log detections for debugging
-        if vehicles:
-            logger.info(f"\nFrame {self.frame_count}: Found {len(vehicles)} vehicles and {len(planes)} planes")
-            for v in vehicles:
-                logger.info(f"Vehicle: YOLO score={v['score']:.2f}")
-        
-        if fuel_trucks and planes:
+        if fuel_trucks and verified_planes:
+            t0 = time.time()
+            
             # Convert frame to RGB for SAM
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             self.sam_predictor.set_image(rgb_frame)
             
-            # Get all masks in one batch
-            truck_boxes = [truck['box'] for truck in fuel_trucks]
-            plane_boxes = [plane['box'] for plane in planes]
-            
             # Process trucks
             truck_masks = []
-            for truck_box in truck_boxes:
-                mask, _, _ = self.sam_predictor.predict(box=truck_box)
+            for truck in fuel_trucks:
+                mask, _, _ = self.sam_predictor.predict(box=truck['box'])
                 truck_masks.append(mask[0].astype(bool))
             
-            # Process planes
+            # Process verified planes
             plane_masks = []
-            for plane_box in plane_boxes:
-                mask, _, _ = self.sam_predictor.predict(box=plane_box)
+            for plane in verified_planes:
+                mask, _, _ = self.sam_predictor.predict(box=plane['box'])
                 plane_masks.append(mask[0].astype(bool))
             
             # Check all interactions
             for truck_idx, (truck, truck_mask) in enumerate(zip(fuel_trucks, truck_masks)):
-                for plane_idx, (plane, plane_mask) in enumerate(zip(planes, plane_masks)):
+                for plane_idx, (plane, plane_mask) in enumerate(zip(verified_planes, plane_masks)):
                     # Calculate SAM-based distances
                     min_dist, norm_dist, plane_dims = self.mask_min_distance(truck_mask, plane_mask)
                     
-                    # Always log spatial metrics
+                    # Log spatial metrics
                     logger.info(
                         f"\nSpatial Analysis (Truck {truck_idx+1} - Plane {plane_idx+1}):"
                         f"\n- Truck-Plane Distance: {min_dist:.1f}px"
@@ -364,6 +415,7 @@ class VideoAnalysisPipeline:
                             'plane': {
                                 'position': plane['box'].tolist(),
                                 'yolo_score': float(plane['score']),
+                                'clip_score': float(plane['clip_score']),
                                 'mask_area': int(np.sum(plane_mask))
                             },
                             'spatial_metrics': {
@@ -379,9 +431,10 @@ class VideoAnalysisPipeline:
                         logger.info(f"\nInteraction detected!")
                         logger.info(f"- Time: {frame_time:.1f}s")
                         logger.info(f"- Fuel truck: YOLO={truck['score']:.2f}, CLIP={truck['clip_score']:.2f}")
+                        logger.info(f"- Plane: YOLO={plane['score']:.2f}, CLIP={plane['clip_score']:.2f}")
                         logger.info(f"- Distance: {min_dist:.1f}px ({norm_dist:.2f}x plane length)")
-        
-        timing['sam'] = time.time() - t0
+            
+            timing['sam'] = time.time() - t0
         
         # Log timing information
         total_time = sum(timing.values())
@@ -393,7 +446,7 @@ class VideoAnalysisPipeline:
         logger.info(timing_str)
         
         # Annotate frame
-        annotated_frame = self.annotate_frame(frame, fuel_trucks, planes, interactions)
+        annotated_frame = self.annotate_frame(frame, fuel_trucks, verified_planes, interactions)
         
         self.frame_count += 1
         return interactions, annotated_frame
@@ -419,7 +472,7 @@ class VideoAnalysisPipeline:
             image_features /= image_features.norm(dim=-1, keepdim=True)
             
             # Calculate similarity with all concepts
-            similarity = (100.0 * image_features @ self.text_features.T).softmax(dim=-1)
+            similarity = (100.0 * image_features @ self.fuel_truck_features.T).softmax(dim=-1)
             
             # Average score for positive prompts (first num_positive_prompts)
             positive_score = similarity[0, :self.num_positive_prompts].mean().item()
@@ -429,7 +482,7 @@ class VideoAnalysisPipeline:
             
             # Log the scores for debugging
             logger.info(f"\nCLIP Scores for vehicle:")
-            for i, (prompt, score) in enumerate(zip(self.text_inputs, similarity[0])):
+            for i, (prompt, score) in enumerate(zip(self.fuel_truck_prompts, similarity[0])):
                 logger.info(f"- {prompt}: {score.item():.3f}")
             logger.info(f"Positive avg: {positive_score:.3f}, Negative avg: {negative_score:.3f}")
             
