@@ -5,31 +5,57 @@
 # Video files
 *.mp4
 
-# Python cache
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
-
-# Distribution / packaging
-dist/
+*.so
+.Python
 build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
 *.egg-info/
+.installed.cfg
+*.egg
 
-# Virtual environments
+# Virtual Environment
 venv/
 env/
 .env/
+ENV/
 
-# IDE settings
-.vscode/
+# IDE
 .idea/
+.vscode/
+*.swp
+*.swo
 
-# Logs
-logs/
-*.log
-
-# Downloads directory
-downloads/
-
-# Output directory
+# Project specific
 output/
+cache/
+logs/
+*.jpg
+*.png
+*.mp4
+*.avi
+*.mov
+*.json
+!requirements.json
+
+# Large files
+*.pt
+*.pth
+*.onnx
+*.bin
+*.h5
+*.hdf5
+*.pkl
