@@ -1,17 +1,16 @@
-torch>=2.3.0
-torchvision>=0.18.0
-opencv-python
-numpy
-scipy
-segment-anything-py
+torch>=2.0.0
+torchvision>=0.15.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+Pillow>=10.0.0
+ultralytics>=8.0.0  # For YOLO
+git+https://github.com/openai/CLIP.git  # For CLIP
+segment-anything>=1.0  # For SAM
+yt-dlp>=2023.3.4  # For YouTube video download
+tqdm>=4.65.0  # For progress bars
+requests>=2.31.0
 matplotlib
-pillow
 shapely
-yt-dlp
-open_clip_torch
-supervision
 moviepy
-ultralytics
-tqdm
+supervision
 python-dotenv==1.0.0
-clip @ git+https://github.com/openai/CLIP.git
