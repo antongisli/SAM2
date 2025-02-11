@@ -1,25 +1,19 @@
 #!/usr/bin/env python3
 
-"""
-Simple CLIP-based analyzer for detecting fuel truck interactions with planes
-"""
-
-import torch
-import clip
-from PIL import Image
+import os
 import cv2
-import numpy as np
+import json
+import torch
 import logging
 import argparse
-from datetime import datetime
-import os
-from pathlib import Path
-import json
-from typing import List, Dict, Tuple
-from tqdm import tqdm
-from ultralytics import YOLO
 import contextlib
-
+import numpy as np
+from PIL import Image
+from datetime import datetime
+from tqdm import tqdm
+from typing import List, Tuple, Dict
+from ultralytics import YOLO
+from transformers import AutoProcessor, AutoModelForCausalLM
 from src.pipeline.core.video_loader import VideoLoader
 
 # Set up logging
@@ -45,83 +39,93 @@ def setup_logging(output_dir: str, level=logging.INFO) -> str:
     
     return log_file
 
-class CLIPAnalyzer:
-    def __init__(self, device: str = 'mps', yolo_threshold: float = 0.9, clip_threshold: float = 0.31):
-        """Initialize CLIP analyzer"""
-        if device is None:
-            device = "mps" if torch.backends.mps.is_available() else \
-                    "cuda" if torch.cuda.is_available() else "cpu"
+class FlorenceAnalyzer:
+    def __init__(self, device: str = 'mps', yolo_threshold: float = 0.3, florence_threshold: float = 0.2):
+        """
+        Initialize the analyzer
+        Args:
+            device: Device to run models on ('cuda', 'cpu', 'mps')
+            yolo_threshold: Minimum confidence for YOLO detections (0-1)
+            florence_threshold: Minimum score for Florence verification (0-1)
+        """
         self.device = device
         
-        # Load CLIP model
-        logging.info(f"Loading CLIP model (ViT-L/14@336px) on {device}...")
-        self.model, self.preprocess = clip.load("ViT-L/14@336px", device=device)
+        # Load Florence-2
+        logging.info(f"Loading Florence-2 model on {device}...")
+        model_id = "microsoft/florence-2-large"
         
-        # Load YOLO model
-        logging.info("Loading YOLO model...")
+        # Use token from environment variable if available
+        token = os.getenv("HUGGINGFACE_TOKEN")
+        if token is None:
+            logging.warning("HUGGINGFACE_TOKEN environment variable not set. You may encounter authentication issues.")
+            
+        self.processor = AutoProcessor.from_pretrained(model_id, token=token, trust_remote_code=True)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            token=token,
+            trust_remote_code=True,
+            torch_dtype=torch.float16 if device == 'cuda' else torch.float32
+        ).to(device).eval()
+        
+        # Load YOLO
+        logging.info(f"Loading YOLO model...")
         self.yolo = YOLO('yolov8x.pt')
         self.yolo.verbose = False
         
         # Thresholds
-        self.yolo_threshold = yolo_threshold  # Minimum confidence for YOLO detections
-        self.clip_threshold = clip_threshold  # Minimum score difference for CLIP verification
+        self.yolo_threshold = yolo_threshold
+        self.florence_threshold = florence_threshold
         
-        # Define prompts for fuel truck verification
-        self.prompts = [
-            # Positive prompts
-            "a truck carrying fuel or liquid",
-            "a fuel tanker truck",
-            "an airport refueling truck",
-            # Negative prompts
-            "a regular delivery truck",
-            "a box truck",
-            "a flatbed truck",
-            "a garbage truck",
-            "a pickup truck"
-        ]
-        
-        # Pre-compute text features
-        self.num_positive = 3  # First 3 prompts are positive
-        self.text_features = self._encode_text(self.prompts)
-        
-    def _encode_text(self, prompts: List[str]) -> torch.Tensor:
-        """Encode text prompts with CLIP"""
-        with torch.no_grad():
-            text_tokens = clip.tokenize(prompts).to(self.device)
-            text_features = self.model.encode_text(text_tokens)
-            text_features /= text_features.norm(dim=-1, keepdim=True)
-        return text_features
-        
+        # Define the task prompt for fuel truck detection
+        self.task_prompt = "Is there a fuel truck or refueling vehicle in this image? Answer yes or no and explain why."
+
     def verify_truck(self, frame: np.ndarray, box: List[float]) -> Tuple[bool, float]:
         """Verify if a detected truck is a fuel truck"""
         x1, y1, x2, y2 = map(int, box)
         truck_img = frame[y1:y2, x1:x2]
         
         # Convert to PIL and preprocess
-        truck_pil = Image.fromarray(cv2.cvtColor(truck_img, cv2.COLOR_BGR2RGB))
-        image_input = self.preprocess(truck_pil).unsqueeze(0).to(self.device)
-        
-        # Get CLIP features and similarity
-        with torch.no_grad():
-            image_features = self.model.encode_image(image_input)
-            image_features /= image_features.norm(dim=-1, keepdim=True)
-            similarity = (100.0 * image_features @ self.text_features.T).softmax(dim=-1)
+        if truck_img.size == 0:
+            return False, 0.0
             
-        # Calculate scores
-        positive_score = similarity[0, :self.num_positive].mean().item()
-        negative_score = similarity[0, self.num_positive:].mean().item()
-        score_diff = positive_score - negative_score
+        pil_image = Image.fromarray(cv2.cvtColor(truck_img, cv2.COLOR_BGR2RGB))
         
-        # Log scores for debugging
-        logging.debug("\nCLIP Scores for truck:")
-        for i, (prompt, score) in enumerate(zip(self.prompts, similarity[0])):
-            logging.debug(f"- {prompt}: {score:.3f}")
-        logging.debug(f"Positive avg: {positive_score:.3f}")
-        logging.debug(f"Negative avg: {negative_score:.3f}")
-        logging.debug(f"Score diff: {score_diff:.3f}")
-        
-        return score_diff > self.clip_threshold, score_diff
-        
+        with torch.no_grad():
+            # Process image with Florence-2
+            inputs = self.processor(
+                text=self.task_prompt,
+                images=pil_image,
+                return_tensors="pt"
+            )
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            
+            # Generate response
+            generated_ids = self.model.generate(
+                input_ids=inputs["input_ids"],
+                pixel_values=inputs["pixel_values"],
+                max_new_tokens=128,
+                early_stopping=True,
+                do_sample=False,
+                num_beams=1
+            )
+            
+            # Decode and post-process
+            generated_text = self.processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
+            answer = self.processor.post_process_generation(
+                generated_text,
+                task=self.task_prompt,
+                image_size=(pil_image.width, pil_image.height)
+            )
+            
+            # Parse the answer
+            is_fuel_truck = answer.lower().startswith("yes")
+            # Use a confidence of 1.0 if yes, 0.0 if no since Florence-2 doesn't provide scores
+            score = 1.0 if is_fuel_truck else 0.0
+            
+            logging.debug(f"Florence-2 response: {answer}")
+            
+            return bool(is_fuel_truck), float(score)
+    
     def analyze_frame(self, frame: np.ndarray) -> Tuple[List[Dict], np.ndarray]:
         """
         Analyze a frame to detect fuel trucks and planes
@@ -155,8 +159,8 @@ class CLIPAnalyzer:
                     logging.debug("  Passed threshold!")
                     # Check for truck
                     if cls == 7:  # Truck
-                        # Verify if it's a fuel truck using CLIP
-                        is_fuel_truck, clip_score = self.verify_truck(frame, [x1, y1, x2, y2])
+                        # Verify if it's a fuel truck using Florence
+                        is_fuel_truck, florence_score = self.verify_truck(frame, [x1, y1, x2, y2])
                         
                         if is_fuel_truck:
                             # Add detection
@@ -164,7 +168,7 @@ class CLIPAnalyzer:
                                 'type': 'fuel_truck',
                                 'box': [x1, y1, x2, y2],
                                 'yolo_conf': conf,
-                                'clip_score': clip_score
+                                'florence_score': florence_score
                             }
                             detections.append(detection)
                             
@@ -173,7 +177,7 @@ class CLIPAnalyzer:
                                         (int(x1), int(y1)), 
                                         (int(x2), int(y2)), 
                                         (0, 255, 0), 2)
-                            text = f"Fuel Truck: {clip_score:.2f}"
+                            text = f"Fuel Truck: {florence_score:.2f}"
                             cv2.putText(annotated_frame, text, 
                                       (int(x1), int(y1)-10), 
                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
@@ -202,26 +206,25 @@ class CLIPAnalyzer:
         return detections, annotated_frame
 
 def main():
-    parser = argparse.ArgumentParser(description='CLIP-based Refueling Detection')
-    parser.add_argument('input_path', help='Path to video file or YouTube URL')
-    parser.add_argument('--skip-frames', type=int, default=1000, help='Number of frames to skip between analyses')
-    parser.add_argument('--threshold', type=float, default=0.2, help='Confidence threshold for detection')
+    parser = argparse.ArgumentParser(description='Detect fuel trucks and airplanes in video')
+    parser.add_argument('input_path', help='Path to input video file or YouTube URL')
+    parser.add_argument('--skip-frames', type=int, default=30, help='Number of frames to skip')
     parser.add_argument('--output-dir', default='output', help='Output directory')
     parser.add_argument('--cache-dir', default='cache', help='Cache directory for downloaded videos')
     parser.add_argument('--yolo-threshold', type=float, default=0.3, help='Minimum confidence for YOLO detections')
-    parser.add_argument('--clip-threshold', type=float, default=0.2, help='Minimum score difference for CLIP verification')
+    parser.add_argument('--florence-threshold', type=float, default=0.2, help='Minimum score for Florence verification')
     parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], help='Logging level')
     args = parser.parse_args()
     
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Set up logging
+    # Setup logging
     log_level = getattr(logging, args.log_level.upper())
     log_file = setup_logging(args.output_dir, level=log_level)
     
     # Initialize analyzer
-    analyzer = CLIPAnalyzer(yolo_threshold=args.yolo_threshold, clip_threshold=args.clip_threshold)
+    analyzer = FlorenceAnalyzer(yolo_threshold=args.yolo_threshold, florence_threshold=args.florence_threshold)
     
     # Initialize video loader
     video_loader = VideoLoader(args.input_path, args.cache_dir)
@@ -265,9 +268,6 @@ def main():
                 ret, frame = video_loader.read()
                 if not ret:
                     break
-                    
-                # Update progress bar
-                pbar.update(1)
                 
                 if frame_number % args.skip_frames == 0:
                     # Analyze frame
@@ -275,26 +275,23 @@ def main():
                     
                     # Add detections
                     for detection in frame_detections:
-                        detection['frame_number'] = frame_number
-                        detection['timestamp'] = frame_number / fps
+                        detection['frame'] = frame_number
                         detections.append(detection)
                         
                     # Write annotated frame to video
                     out.write(annotated_frame)
-                # else:
-                #     # Write original frame to video
-                #     out.write(frame)
                     
                 frame_number += 1
+                pbar.update(1)
                 
     finally:
         video_loader.release()
         out.release()
         
     # Save detection results
-    results_path = os.path.join(args.output_dir, 'detections.json')
-    with open(results_path, 'w') as f:
-        json.dump({'detections': detections}, f, indent=2)
+    results_file = os.path.join(args.output_dir, 'detections.json')
+    with open(results_file, 'w') as f:
+        json.dump(detections, f, indent=2)
         
     logging.info(f"\nAnalysis complete!")
     logging.info(f"Found {len(detections)} potential fuel trucks")
