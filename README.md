@@ -82,6 +82,71 @@ python clip_analyzer.py "https://www.youtube.com/watch?v=VIDEO_ID" --skip-frames
 --cache-dir cache     # Directory for YouTube video cache
 ```
 
+## 3. Simple Florence Image Analysis
+
+The `simple_florence.py` script provides a simple interface to the Florence-2 vision model, offering multiple modes for analyzing images.
+
+### Usage
+
+```bash
+python simple_florence.py <image_path> --mode <mode>
+```
+
+Available modes:
+
+1. **objects** - General object detection
+```bash
+python simple_florence.py image.jpg --mode objects
+# Detects common objects like: "truck", "person", "airplane", "wheel"
+```
+
+2. **regions** - Salient region detection
+```bash
+python simple_florence.py image.jpg --mode regions
+# Identifies regions of interest without labels
+```
+
+3. **caption** - Detailed region descriptions
+```bash
+python simple_florence.py image.jpg --mode caption
+# Provides detailed captions like: "fuel truck parked next to an aircraft"
+```
+
+4. **vocab** - Search for specific objects
+```bash
+python simple_florence.py image.jpg --mode vocab --prompt "fuel truck"
+# Finds instances of the specified object (finds one, more accurate)
+```
+
+5. **grounding** - Natural language object search
+```bash
+python simple_florence.py image.jpg --mode grounding --prompt "fuel truck next to the airplane"
+# Locates objects based on natural language descriptions
+```
+
+### Output
+
+For all modes, the script:
+1. Saves an annotated image as `output.jpg`
+2. Displays detection results in the terminal, including:
+   - Bounding box coordinates
+   - Confidence scores
+   - Object labels or captions
+
+### Examples
+
+Finding fuel trucks:
+```bash
+# Using specific object detection
+python simple_florence.py airport.jpg --mode vocab --prompt "fuel truck"
+
+# Using natural language search
+python simple_florence.py airport.jpg --mode grounding --prompt "fuel truck refueling an airplane"
+
+# Getting detailed scene description
+python simple_florence.py airport.jpg --mode caption
+```
+
 ## Output
 
 Both versions generate:
