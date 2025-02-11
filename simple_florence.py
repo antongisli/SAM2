@@ -185,49 +185,6 @@ def analyze_image(image_path, search_term=None, mode="grounding", device="mps"):
                 'labels': [],
                 'scores': []
             }
-    elif mode == "combined":
-        if not search_term:
-            print("Error: Search term required for combined mode")
-            return None, None
-            
-        print(f"Using Combined Detection mode, searching for: {search_term}")
-        # Try both open vocab detection and phrase grounding
-        task_prompt = TaskType.OPEN_VOCAB_DETECTION
-        results_od = utils.run_example(task_prompt, image, text_input=search_term, device=device)
-        print("\nOpen Vocabulary Detection Results:")
-        print(results_od)
-        
-        task_prompt = TaskType.PHRASE_GROUNDING
-        results_pg = utils.run_example(task_prompt, image, text_input=f"Find all {search_term}s in the image", device=device)
-        print("\nPhrase Grounding Results:")
-        print(results_pg)
-        
-        # Combine results from both methods
-        boxes = []
-        labels = []
-        scores = []
-        
-        # Add Open Vocabulary Detection results (higher confidence)
-        if TaskType.OPEN_VOCAB_DETECTION in results_od:
-            od_results = results_od[TaskType.OPEN_VOCAB_DETECTION]
-            if 'bboxes' in od_results and 'bboxes_labels' in od_results:
-                boxes.extend(od_results['bboxes'])
-                labels.extend(od_results['bboxes_labels'])
-                scores.extend([1.0] * len(od_results['bboxes']))  # Higher confidence for specific detection
-        
-        # Add Phrase Grounding results (lower confidence)
-        if TaskType.PHRASE_GROUNDING in results_pg:
-            pg_results = results_pg[TaskType.PHRASE_GROUNDING]
-            if 'bboxes' in pg_results and 'labels' in pg_results:
-                boxes.extend(pg_results['bboxes'])
-                labels.extend([search_term] * len(pg_results['bboxes']))
-                scores.extend([0.9] * len(pg_results['bboxes']))  # Lower confidence for general detection
-        
-        results = {
-            'bboxes': boxes,
-            'labels': labels,
-            'scores': scores
-        }
     elif mode == "objects":
         print("Using Object Detection mode")
         task_prompt = TaskType.OBJECT_DETECTION
@@ -283,12 +240,11 @@ def main():
     parser.add_argument('--search', 
                       help='Search for specific objects (e.g., "a fuel truck", "aircraft on the ground")')
     parser.add_argument('--mode', default='grounding', 
-                      choices=['grounding', 'caption', 'vocab', 'combined', 'objects', 'regions'],
+                      choices=['grounding', 'caption', 'vocab', 'objects', 'regions'],
                       help='''Detection mode:
                            "grounding": phrase grounding (natural language search)
                            "vocab": open vocabulary detection (precise search)
                            "caption": dense region caption (detailed descriptions)
-                           "combined": both vocab and grounding
                            "objects": general object detection
                            "regions": region proposals only''')
     args = parser.parse_args()
